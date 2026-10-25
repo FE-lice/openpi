@@ -1,0 +1,128 @@
+import json
+import os
+import shutil
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datasets import Dataset, Features, Image, Value, Sequence
+
+def convert_v3_to_v21(v3_dir, v21_dir):
+    v3_dir = Path(v3_dir)
+    v21_dir = Path(v21_dir)
+    
+    # 0. 清理之前残留的脏数据
+    if v21_dir.exists():
+        print(f"🧹 清理旧的输出目录: {v21_dir}")
+        shutil.rmtree(v21_dir)
+
+    print(f"🚀 开始转换: {v3_dir} -> {v21_dir}")
+    
+    (v21_dir / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    (v21_dir / "meta").mkdir(parents=True, exist_ok=True)
+    
+    # 1. 转换 tasks
+    tasks_df = pd.read_parquet(v3_dir / "meta" / "tasks.parquet")
+    tasks_map = {}
+    with open(v21_dir / "meta" / "tasks.jsonl", "w") as f:
+        for task_str, row in tasks_df.iterrows():
+            task_idx = int(row['task_index']) if 'task_index' in row else 0
+            tasks_map[task_idx] = str(task_str)
+            f.write(json.dumps({"task_index": task_idx, "task": str(task_str)}) + "\n")
+            
+    # 2. 读取所有 v3 数据并合并
+    data_files = list((v3_dir / "data").rglob("*.parquet"))
+    print(f"找到 {len(data_files)} 个数据文件，正在加载...")
+    df = pd.concat([pd.read_parquet(f) for f in data_files], ignore_index=True)
+    
+    episodes = df["episode_index"].unique()
+    episodes_info = []
+    episodes_stats = []
+    
+    # 3. 定义 v2.1 的特征结构 (强制要求 Image 类型)
+    features = Features({
+        "observation.state": Sequence(Value("float32")),
+        "action": Sequence(Value("float32")),
+        "observation.images.front": Image(),
+        "timestamp": Value("float32"),
+        "frame_index": Value("int64"),
+        "episode_index": Value("int64"),
+        "index": Value("int64"),
+        "task_index": Value("int64")
+    })
+    
+    # 4. 按 Episode 拆分保存
+    for ep_idx in episodes:
+        ep_df = df[df["episode_index"] == ep_idx].copy()
+        ep_df = ep_df.sort_values("frame_index").reset_index(drop=True)
+        
+        length = len(ep_df)
+        task_idx = int(ep_df["task_index"].iloc[0]) if "task_index" in ep_df.columns else 0
+        
+        cols_to_keep = [
+            "observation.state", "action", "observation.images.front",
+            "timestamp", "frame_index", "episode_index", "index", "task_index"
+        ]
+        cols_exist = [c for c in cols_to_keep if c in ep_df.columns]
+        out_df = ep_df[cols_exist].copy()
+        
+        # ⚠️ 核心修复：使用 datasets.Dataset 和 features 来保存，确保图片被正确编码
+        ds = Dataset.from_pandas(out_df, features=features)
+        out_path = v21_dir / "data" / "chunk-000" / f"episode_{ep_idx:06d}.parquet"
+        ds.to_parquet(str(out_path))
+        
+        episodes_info.append({
+            "episode_index": int(ep_idx),
+            "tasks": [tasks_map.get(task_idx, "")],
+            "length": length
+        })
+        
+        # 计算统计量
+        try:
+            state_data = np.stack(ep_df["observation.state"].values)
+            action_data = np.stack(ep_df["action"].values)
+            ep_stats = {
+                "episode_index": int(ep_idx),
+                "stats": {
+                    "observation.state": {
+                        "count": [length], 
+                        "mean": state_data.mean(0).tolist(), "std": state_data.std(0).tolist(),
+                        "min": state_data.min(0).tolist(), "max": state_data.max(0).tolist()
+                    },
+                    "action": {
+                        "count": [length],
+                        "mean": action_data.mean(0).tolist(), "std": action_data.std(0).tolist(),
+                        "min": action_data.min(0).tolist(), "max": action_data.max(0).tolist()
+                    }
+                }
+            }
+            episodes_stats.append(ep_stats)
+        except Exception as e:
+            print(f"Episode {ep_idx} 统计失败: {e}")
+            
+    # 5. 写入元数据
+    with open(v21_dir / "meta" / "episodes.jsonl", "w") as f:
+        for ep in episodes_info: f.write(json.dumps(ep) + "\n")
+    with open(v21_dir / "meta" / "episodes_stats.jsonl", "w") as f:
+        for stat in episodes_stats: f.write(json.dumps(stat) + "\n")
+        
+    # 6. 修改 info.json
+    with open(v3_dir / "meta" / "info.json", "r") as f:
+        info = json.load(f)
+        
+    info["codebase_version"] = "v2.1"
+    info["total_episodes"] = len(episodes)
+    info["total_frames"] = len(df)
+    info["data_path"] = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+    if "video_path" in info:
+        info["video_path"] = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+        
+    with open(v21_dir / "meta" / "info.json", "w") as f:
+        json.dump(info, f, indent=4)
+        
+    print(f"✅ 转换完成！生成了 {len(episodes)} 个 Episode。")
+
+if __name__ == "__main__":
+    convert_v3_to_v21(
+        "/root/autodl-tmp/UAV-Flow/lerobot_uav_data", 
+        "/root/autodl-tmp/UAV-Flow/lerobot_uav_v21"
+    )

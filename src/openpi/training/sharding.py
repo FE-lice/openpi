@@ -1,3 +1,9 @@
+"""
+实现分布式训练时的模型参数分片
+    提供 `fsdp_sharding` 函数用于全参数数据并行(FSDP)的实现
+    基于 JAX 的分片机制，优化大规模模型的训练性能
+    通过 `activation_sharding_constraint` 处理激活值的分片
+"""
 import contextlib
 import logging
 

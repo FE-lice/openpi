@@ -96,9 +96,28 @@ def create_policy(args: Args) -> _policy.Policy:
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+# ====== 临时：不加载模型，固定动作 policy ======
+class _FakePolicy:
+    """仅用于联调：不加载 checkpoint，直接返回固定动作。"""
+
+    metadata = {}
+
+    def infer(self, obs):
+        return {
+            "actions": [
+                [100.0, 0.0, 20.0, 1.5707963267948966],
+                [100.0, 0.0, 20.0, 1.5707963267948966],
+            ]
+        }
+
+
 def main(args: Args) -> None:
-    policy = create_policy(args)
-    policy_metadata = policy.metadata
+    # ====== 临时：注释掉模型加载，返回固定动作 ======
+    # 恢复真实推理时，取消下面两行注释，并删除 policy = _FakePolicy()
+    # policy = create_policy(args)
+    # policy_metadata = policy.metadata
+    policy = _FakePolicy()
+    policy_metadata = {}
 
     # Record the policy's behavior.
     if args.record:

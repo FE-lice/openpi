@@ -1,3 +1,68 @@
+"""
+【协议接口 Protocol】
+├── Dataset[T_co]           可随机访问（__getitem__ / __len__）
+├── IterableDataset[T_co]   可迭代（__iter__ / __len__）
+└── DataLoader[T_co]        数据加载器（data_config / __iter__）
+
+【数据集实现】
+├── TransformedDataset          在 Dataset 上套一层变换
+├── IterableTransformedDataset  在 IterableDataset 上套一层变换（支持拆 batch）
+└── FakeDataset                 假数据，调试用
+
+【数据集工厂】
+├── create_torch_dataset   从 LeRobot 创建
+└── create_rlds_dataset    从 RLDS/DROID 创建
+
+【变换函数】
+├── transform_dataset            给 Dataset 套变换
+└── transform_iterable_dataset   给 IterableDataset 套变换
+
+【DataLoader 创建】
+├── create_data_loader           入口，按 rlds_data_dir 分发
+├── create_torch_data_loader     走 LeRobot 路径
+└── create_rlds_data_loader      走 RLDS 路径
+
+【DataLoader 实现】
+├── TorchDataLoader   包装 torch.utils.data.DataLoader
+├── RLDSDataLoader    包装 DroidRldsDataset
+└── DataLoaderImpl    统一包装，输出 (Observation, Actions)
+
+【辅助函数】
+├── _collate_fn        把样本堆成 batch
+└── _worker_init_fn    限制 worker 里 JAX 预分配显存
+
+
+
+原始数据集(LeRobot / RLDS)
+   │
+   ├── create_torch_dataset / create_rlds_dataset
+   │        ↓
+   │   得到原始 Dataset
+   │
+   ├── transform_dataset / transform_iterable_dataset
+   │        ↓
+   │   套上四段变换：
+   │     repack_transforms.inputs    重命名 key
+   │     data_transforms.inputs      机器人特定变换
+   │     Normalize(...)              归一化(用 norm_stats)
+   │     model_transforms.inputs     tokenize / pad
+   │        ↓
+   │   得到 TransformedDataset
+   │
+   ├── TorchDataLoader / RLDSDataLoader
+   │        ↓
+   │   加 batch、shuffle、sharding
+   │        ↓
+   └── DataLoaderImpl
+            ↓
+        输出 (Observation, Actions)
+
+
+上层训练代码只需要:
+loader = create_data_loader(config)
+for obs, actions in loader:
+    ...
+"""
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -126,7 +191,35 @@ class FakeDataset(Dataset):
     def __len__(self) -> int:
         return self._num_samples
 
+"""to do :多加一路首帧图像输入作为对照
+class EpisodeFirstFrameDataset:
+    def __init__(self, dataset):
+        self.dataset = dataset
 
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]  # 当前帧
+        episode_index = int(sample["episode_index"])
+
+        # 根据 LeRobot 的 episode 边界取得这条轨迹的全局起始行号
+        start_index = int(self.dataset.episode_data_index["from"][episode_index])
+
+        # 读取轨迹首帧的图像，并作为额外字段附在当前样本上
+        first_frame = self.dataset[start_index]
+        sample["observation/first_image"] = first_frame["observation.images.front"]
+        return sample
+"""
+# 返回的是一个dataset对象，不是在这里加载数据，里面增加了一个delta_timestamps的偏移操作并取回了文本
+'''
+image        float32 (3, 256, 256)  值域 [0, 1]     ← 注意：CHW，且已 /255
+wrist_image  float32 (3, 256, 256)
+state        float32 (8,)
+actions      float32 (50, 7)        ← 不是 (7,)，已经是 50 步
+task_index   int64 ->> (prompt)
+prompt = "open the top drawer"
+'''
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,16 +230,21 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.root,
+        # 取出50帧，对action_sequence_keys=("action", "action_cartesian")里的每一个列名，生成时间偏移，LeRobot 在取这一帧时，会把这些偏移对应的未来帧一起取出来堆叠
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
 
+    # 
+    # PromptFromLeRobotTask：文本索引转换器
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
 
     return dataset
 
@@ -183,10 +281,10 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     return TransformedDataset(
         dataset,
         [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
+            *data_config.repack_transforms.inputs,     # 键名映射
+            *data_config.data_transforms.inputs,       # 例libero_policy.LiberoInputs  可能有DeltaActions
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),  # normlize归一化
+            *data_config.model_transforms.inputs,      # 例libero_policy.LiberoOutputs 可能有AbsoluteActions
         ],
     )
 
@@ -267,7 +365,7 @@ def create_data_loader(
         framework=framework,
     )
 
-
+#  定义dataloader
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -302,9 +400,9 @@ def create_torch_data_loader(
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    # Use TorchDataLoader for both frameworks
-    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-    # For JAX, divide by process count
+    # Use TorchDataLoader for both frameworks 对每个进程实例化一个TorchDataLoader
+    # For PyTorch DDP, create DistributedSampler and divide batch size by world size  # pytorch分布式训练，采用DDP
+    # For JAX, divide by process count      # jax分布式训练
     sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -321,7 +419,7 @@ def create_torch_data_loader(
     else:
         local_batch_size = batch_size // jax.process_count()
 
-    logging.info(f"local_batch_size: {local_batch_size}")
+    logging.info(f"local_batch_size: {local_batch_size}")  #  每个GPU实际batch大小
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,

@@ -1,3 +1,11 @@
+"""
+定义了多种学习率调度策略：
+    `CosineDecaySchedule`：余弦衰减学习率
+    `RsqrtDecaySchedule`：反平方根衰减学习率
+实现了常用优化器配置：
+    `AdamW`：带有权重衰减的 Adam 优化器
+    `SGD`：随机梯度下降优化器
+"""
 import dataclasses
 from typing import Protocol, runtime_checkable
 

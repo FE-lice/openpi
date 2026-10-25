@@ -207,7 +207,7 @@ class DeltaActions(DataTransformFn):
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
-    mask: Sequence[bool] | None
+    mask: Sequence[bool] | None    #  指出哪些维度动作是要从绝对量转为相对增量的
 
     def __call__(self, data: DataDict) -> DataDict:
         if "actions" not in data or self.mask is None:

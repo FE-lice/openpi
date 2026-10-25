@@ -1,3 +1,12 @@
+"""
+定义了 `WeightLoader` 协议，用于加载预训练权重，且实现了多种加载策略：
+
+    `NoOpWeightLoader`：不加载权重（用于从头训练）
+    `CheckpointWeightLoader`：从检查点加载完整权重
+    `PaliGemmaWeightLoader`：从官方 PaliGemma 检查点加载权重
+
+另，还支持权重合并功能，可以部分加载权重（如 LoRA 微调）
+"""
 import dataclasses
 import logging
 import re

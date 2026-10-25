@@ -8,36 +8,44 @@ import sentencepiece
 from transformers import AutoProcessor
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
-import openpi.shared.download as download
+import openpi.shared.download as download     #  来源于big_vision的下载工具，支持从gs://下载文件，并缓存到本地
 
 
 class PaligemmaTokenizer:
-    def __init__(self, max_len: int = 48):
+    """将 PI0 / PI05 的任务文本（以及可选状态）编码为 PaliGemma token。"""
+
+    def __init__(self, max_len: int = 48):  # 最大 token 长度
         self._max_len = max_len
 
+        # 下载并载入 SentencePiece 模型，用它把文本转换为整数 token
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-        with path.open("rb") as f:
+        with path.open("rb") as f:    # rb:以只读、二进制方式打开文件
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:   # ndarray指数组
+        # 通过 `strip()` 去除首尾空白，然后将下划线替换为空格，并将换行符也替换为空格
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        # 状态的两种处理方式
         if state is not None:
-            # This is the Pi05 format, where the state is part of the discrete language input.
+            # 生成-1至1的257个连续点并去掉最后一个得到256个点[-1,...,0.9921]，进而形成256个离散区间，将状态值映射到这些区间中，索引即状态编号
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-            state_str = " ".join(map(str, discretized_state))
+            state_str = " ".join(map(str, discretized_state))     # 将数值全部转换成字符串并用空格拼接
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            # Task: pick up the cup, State: 0 63 127 191 255;\nAction:        最后同时多模态token化并在开头加上<bos>？？
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
-            # This is the Pi0 format, where the state is part of the continuous action expert input.
-            # tokenize "\n" separately as the "start of answer" token
+            # PI0 的状态作为连续数值输入动作专家，不放进文本 token
+            # <bos> pick up the cup \n
             tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
+            # 将 token 填充到固定长度，转换后id 0
             padding = [False] * (self._max_len - tokens_len)
             mask = [True] * tokens_len + padding
             tokens = tokens + padding
         else:
             if len(tokens) > self._max_len:
+                # 超长时截断，避免log提示
                 logging.warning(
                     f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
@@ -49,37 +57,41 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
+    """将文本、状态和 FAST 动作 token 编码到统一序列，并支持把动作 token 解码回连续动作。"""
+
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len
 
-        # Download base PaliGemma tokenizer
+        # PaliGemma tokenizer 负责 prompt/state 文字及序列分隔符的编码。
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-        # Instantiate FAST tokenizer
+        # FAST processor 负责把连续动作序列量化为动作 token，以及执行反向解码。
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
-        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+        # PaliGemma 词表末尾有专用 token；此偏移量用于在 FAST 与 PaliGemma token 编号间转换。
+        self._fast_skip_tokens = 128
 
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        # 清理任务文本；FAST 约定将 prompt 转为小写并替换下划线。
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
-        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        # 假设状态已归一化到 [-1, 1]，将每个状态值量化为 0 到 255 的离散编号。
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
-        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        # prefix 包含任务描述和状态编号；BOS 标记放在 prefix 开头。
         state_str = " ".join(map(str, discretized_state))
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
 
         if actions is not None:
-            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
+            # 为动作数组添加 batch 维度后用 FAST 编码，再将 token 编号映射到 PaliGemma 词表范围。
             action_tokens = self._fast_tokenizer(actions[None])[0]
             action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
 
-            # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
+            # postfix 按约定由 Action:、动作 token 和结束标记 | 组成。
             postfix_tokens = (
                 self._paligemma_tokenizer.encode("Action: ")
                 + action_tokens_in_pg.tolist()
@@ -88,14 +100,15 @@ class FASTTokenizer:
         else:
             postfix_tokens = []
 
-        # Create output token sequence & masks
-        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        # 拼接输入前缀和可选的动作后缀，并构造训练/注意力所需的 mask。
+        # token_mask 标记有效 token；ar_mask=0 表示 prefix 双向注意，1 表示 postfix 因果注意。
         tokens = prefix_tokens + postfix_tokens
         token_mask = [True] * len(tokens)
         ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
-        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+        # 只在动作后缀上计算 loss，prompt/state 前缀仅作为条件输入。
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)
 
-        # Pad tokens to max length
+        # 补齐到固定长度，保证批次中的序列形状一致；padding 位置在各 mask 中均为无效。
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -105,6 +118,7 @@ class FASTTokenizer:
             loss_mask = loss_mask + padding
         else:
             if len(tokens) > self._max_len:
+                # 超出最大长度时截断 token 和对应 mask，确保它们仍逐项对齐。
                 logging.warning(
                     f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
@@ -117,23 +131,25 @@ class FASTTokenizer:
         return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
 
     def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
-        # Decode predicted output tokens
+        # 先把模型输出的 PaliGemma token 序列还原成文本。
         decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
 
-        # Extract actions from FAST model outputs
+        # 没有动作标记通常表示输出不完整，返回全零动作作为回退值。
         if "Action: " not in decoded_tokens:
             return np.zeros((action_horizon, action_dim), dtype=np.float32)
 
-        # Extract actions from decoded tokens
+        # 截取 Action: 与结束符 | 之间的动作 token 文本，再编码并映射回 FAST token 编号。
         raw_action_tokens = np.array(
             self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
         )
         action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        # FAST 解码器将离散动作 token 还原为指定时间长度和动作维度的连续动作。
         return self._fast_tokenizer.decode(
             [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
         )[0]
 
     def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        # 统一输入类型，然后按词表末尾的反向编号规则转换 token ID。
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
